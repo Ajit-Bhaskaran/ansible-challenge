@@ -1,1 +1,212 @@
----
+- name: Web server setup
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+  - group_vars/web_servers.yml
+  tasks:
+
+  # Block is a Group of Tasks combined together
+  - name: Get Info Block for existing instances
+    block:
+    - name: Get Running instance Info
+
+      ec2_instance_info:
+        region: us-east-1
+        filters:
+          "tag:Name": ["web1", "web2"]
+          instance-state-name: ["running"]
+      register: existing_instances
+
+    - name: Check instance name
+      debug: var="existing_instances"
+
+  - name: Create security group for ec2 instances
+    amazon.aws.ec2_security_group:
+      name: securitygroup_web
+      description: Security group with port 80 and 22 and 443 open
+      region: us-east-1
+      rules:
+      - proto: tcp
+        from_port: 80
+        to_port: 80
+        cidr_ip: 0.0.0.0/0
+      - proto: tcp
+        from_port: 22
+        to_port: 22
+        cidr_ip: 0.0.0.0/0
+      - proto: tcp
+        from_port: 443
+        to_port: 443
+        cidr_ip: 0.0.0.0/0
+    when: existing_instances.instances | length == 0
+
+  - name: Create EC2 Block
+    block:
+    - name: Launch instances
+      tags: ec2-create
+      ec2_instance:
+        region: us-east-1
+        key_name: myexp
+        instance_type: t2.micro
+        name: "{{ item.name }}"
+        image_id: "{{ item.image }}"
+        security_group: securitygroup_web
+        wait: true
+        wait_timeout: 500
+        count: 1
+        tags:
+          os: linux
+        vpc_subnet_id: subnet-0da5d635ba5928390
+        network:
+          assign_public_ip: true
+      register: ec2
+      delegate_to: localhost
+      loop: "{{ web_servers }}"
+      when: existing_instances.instances | length == 0
+
+
+  - name: Get Info for created instances and wait for ssh
+    block:
+    - name: Pause for 30 seconds
+      pause:
+        seconds: 30
+    - name: Get Running instance Info
+      ec2_instance_info:
+        region: us-east-1
+        filters:
+          "tag:Name": ["web1", "web2"]
+          instance-state-name: ["running"]
+      register: instance_info
+    - name: Check SSH availability
+      wait_for:
+        host: "{{ instance_info.instances[0].public_ip_address }}"
+        port: 22
+        delay: 60
+        connect_timeout: 600
+      when: instance_info.instances | length > 0
+
+  - name: Get Info for created instances and populate inventory
+    block:
+    - name: Get Running instance Info
+      ec2_instance_info:
+        region: us-east-1
+        filters:
+          "tag:Name": ["web1", "web2"]
+          instance-state-name: ["running"]
+      register: created_instances
+    - name: Check instance name
+      debug: var="created_instances"
+      no_log: true
+    - name: update inventory file
+      script: invent.py
+      delegate_to: localhost
+    - name: Refresh inventory
+      meta: refresh_inventory
+
+- name: Web server setup
+  hosts: web1, web2
+  gather_facts: false
+  # vars_files:
+  # - group_vars/web_servers.yml
+  tasks:
+  - name: Install packages
+    become: true
+    package:
+      name:
+      - httpd
+      - mod_ssl
+      - chrony
+      - openssh-server
+      - vim
+      - wget
+      - git
+      - net-tools
+      - curl
+      - tree
+      - unzip
+      - python3-cryptography
+      state: present
+
+  - name: Start and enable httpd service
+    become: true
+    service:
+      name: httpd
+      state: started
+      enabled: true
+
+  - name: Generate self-signed SSL/TLS certificate
+    become: true
+    command: |
+      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/pki/tls/private/localhost.key \
+        -out /etc/pki/tls/certs/localhost.crt \
+        -subj "/CN=webserver_ec2"
+    args:
+      creates:
+      - /etc/pki/tls/private/localhost.key
+      - /etc/pki/tls/certs/localhost.crt
+
+  - name: Configure Apache SSL module
+    become: true
+    lineinfile:
+      path: /etc/httpd/conf.d/ssl.conf
+      regexp: "{{ item.regexp }}"
+      line: "{{ item.line }}"
+    with_items:
+    - {regexp: '^SSLCertificateFile', line: 'SSLCertificateFile /etc/pki/tls/certs/localhost.crt'}
+    - {regexp: '^SSLCertificateKeyFile', line: 'SSLCertificateKeyFile /etc/pki/tls/private/localhost.key',}
+
+  - name: Restart Apache service
+    become: true
+    service:
+      name: httpd
+      state: restarted
+
+  - name: SSH hardening
+    become: true
+    lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: "{{ item.regexp }}"
+      line: "{{ item.line }}"
+    with_items:
+    - {regexp: '^PermitRootLogin', line: 'PermitRootLogin no'}
+    - {regexp: '^PasswordAuthentication', line: 'PasswordAuthentication no'}
+    - {regexp: '^X11Forwarding', line: 'X11Forwarding no'}
+    - {regexp: '^PermitEmptyPasswords', line: 'PermitEmptyPasswords no',}
+
+  - name: Configure chrony
+    become: true
+    yum:
+      name: chrony
+      state: present
+
+  - name: Set chrony configuration
+    become: true
+    lineinfile:
+      path: /etc/chrony.conf
+      line: "{{ item }}"
+    with_items:
+    - server time.nist.gov iburst
+    - allow 192.168.0.0/24
+
+  - name: Start chrony service
+    become: true
+    service:
+      name: chronyd
+      state: started
+      enabled: true
+
+  - name: Set timezone to Australia/Sydney
+    become: true
+    timezone:
+      name: Australia/Sydney
+
+  - name: Copy HTML files to remote server
+    become: true
+    ansible.builtin.copy:
+      src: "{{ item.src }}"
+      dest: "{{ item.dest }}"
+      mode: "0644"
+    with_items:
+    - {src: "aientry.html", dest: "/var/www/html/aientry.html"}
+    - {src: "ascii-cam.html", dest: "/var/www/html/ascii-cam.html",}
