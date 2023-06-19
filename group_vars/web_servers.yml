@@ -1,0 +1,10 @@
+---
+web_servers:
+  - name: web1
+    key_name: myexp
+    image: ami-026ebd4cfe2c043b2
+    instance_type: t2.micro
+  - name: web2
+    key_name: myexp
+    image: ami-026ebd4cfe2c043b2
+    instance_type: t2.micro
